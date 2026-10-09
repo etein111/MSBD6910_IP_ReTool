@@ -2,9 +2,10 @@
 # ReTool RL smoke：验证 SFT 冷启动 ckpt 能被 RL（GRPO/DAPO）正确加载，并跑 5 步看 reward 信号。
 #
 # 与 run_qwen3_1.7b_smoke.sh 的唯一区别：model_path 从 base 换成 SFT 冷启动产物
-#   checkpoints/qwen3-1.7b-instruct-sft/global_step_372
-# 这一步是 SFT→RL 衔接的最大风险点（verl 能否从 FSDP 格式 ckpt 加载权重）。
-# 预期：SFT 后模型已会调工具 + 输出 \boxed{}，初始 reward 应显著高于 base 冒烟（mean −0.62）。
+#   checkpoints/qwen3-1.7b-instruct-sft-2ep/global_step_124-hf（2-epoch 温和版 FSDP→HF 合并后目录）
+# 这一步是 SFT→RL 衔接的最大风险点（verl 用 AutoModelForCausalLM.from_pretrained 从 model.path
+# 根目录读 HF 权重，SFT 只存了 FSDP 权重，需先经 verl.model_merger 合并成 -hf 目录）。
+# 预期：2-epoch SFT 保留 base 推理 + 学会调工具 + 输出 \boxed{}，初始 reward 应显著高于旧 6-epoch（0%）。
 #
 # 用法：cd /scratch/mscbdtspod2026/cyeah/retool/code/work && bash run_qwen3_1.7b_dapo_smoke.sh
 
@@ -19,7 +20,7 @@ CKPT_ROOT=$PROJECT_ROOT/checkpoints
 dapo_math_17k=$DATA_ROOT/dataset_clean/BytedTsinghua-SIA/DAPO-Math-17k-smoke
 aime_2024=$DATA_ROOT/dataset_clean/Maxwell-Jia/AIME_2024
 aime_2025=$DATA_ROOT/dataset_clean/yentinglin/aime_2025
-model_path=$CKPT_ROOT/qwen3-1.7b-instruct-sft/global_step_372
+model_path=$CKPT_ROOT/qwen3-1.7b-instruct-sft-2ep/global_step_124-hf
 
 train_files="['$dapo_math_17k']"
 test_files="['$aime_2025', '$aime_2024']"

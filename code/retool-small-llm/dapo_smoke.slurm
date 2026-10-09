@@ -1,5 +1,5 @@
 #!/bin/bash
-# ReTool RL 冒烟：验证 SFT 冷启动 ckpt（global_step_372）能被 RL（GRPO/DAPO）正确加载，单卡 5 步。
+# ReTool RL 冒烟：验证 SFT 冷启动 ckpt（2ep 版 global_step_124）能被 RL（GRPO/DAPO）正确加载，单卡 5 步。
 # 与 smoke.slurm 的唯一区别：运行 run_qwen3_1.7b_dapo_smoke.sh（model_path 指向 SFT ckpt）。
 #
 # 提交（在 login node）：

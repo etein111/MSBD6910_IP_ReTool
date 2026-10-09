@@ -86,6 +86,9 @@
    报 `KeyError: 'num_turns'`。**修法**：跑 `patch_verl_num_turns.py` 补丁到 installed 的
    `verl/experimental/agent_loop/tool_agent_loop.py`，构造 `AgentLoopOutput` 时把 `num_turns`
    一并塞进 `extra_fields`（幂等，可重复跑）。**重装 verl 后要重打**（patch 脚本在 `code/work/`）。
+10. **SFT→RL 衔接：verl 0.6.1 的 RL 从 `model.path` 根目录加载 tokenizer + config + HF 权重，但 SFT ckpt 三者都不在根目录**。两处要补（2026-10-09 踩过，job 664052/664071/668747 连环 FAILED）：
+    - **tokenizer/config 在 `huggingface/` 子目录**：`fsdp_workers.py:302` `hf_tokenizer(local_path)` 与 `:320` `AutoConfig.from_pretrained(local_path)` 都读**根目录**，而 SFT 把它们存进 `huggingface/`。症状 `TypeError: vocab_file=None`（慢速 tokenizer 在根目录找不到 vocab.json）。修法：`cp ckpt/huggingface/* ckpt/` 铺到根目录。
+    - **缺 HF 权重（safetensors）**：SFT 默认 `trainer.checkpoint.save_contents=["model","optimizer","extra"]` **不含 `hf_model`**，ckpt 只有 FSDP 权重 `model_world_size_1_rank_0.pt`。RL `_build_model_optimizer:377` 用 `AutoModelForCausalLM.from_pretrained(local_path)` 加载 HF 权重，报 `OSError: no file named pytorch_model.bin / model.safetensors`。修法：用 verl 自带 merger 转 HF：`python -m verl.model_merger merge --backend fsdp --local_dir <ckpt> --target_dir <ckpt>-hf`（从 `local_dir/huggingface/config.json` 读 config），RL 的 `model_path` 指向 `-hf` 目录。
 
 ---
 
@@ -102,7 +105,7 @@
 │   └── work/                   # ★ 运行目录 —— 所有训练命令都从这里跑
 │       ├── recipe/retool/      # 从 verl-recipe/retool 复制而来，可自由改
 │       │   ├── retool.py               # 官方：自定义数据集类 + reward 函数
-│       │   ├── retool_dataset_utils.py # 官方：字段映射 map_fn/map_fn2
+│       │   ├── retool_dataset_utils.py # ★ 自研修复版：字段映射 map_fn/map_fn2（map_fn2 剥 DAPO 外层模板，修格式冲突）
 │       │   ├── retool_sft_preprocess.py# 官方：SFT 数据预处理
 │       │   ├── sft_preprocess.py       # ★ 自研：官方 SFT 预处理的本地沙箱版（tool_schema 改用 local_tool_config，与 RL 一致）
 │       │   ├── sandbox_fusion_tool_config.yaml # 官方沙箱配置（需独立部署，未用）
@@ -110,8 +113,13 @@
 │       │   └── local_tool_config.yaml  # ★ 自研：指向本地沙箱的 tool 配置
 │       ├── run_qwen3_1.7b_smoke.sh     # ★ 冒烟测试 launch 脚本
 │       ├── run_qwen3_1.7b_sft.sh       # ★ SFT 冷启动 launch 脚本（bf16+micro_batch=2+truncation=left）
+│       ├── run_qwen3_1.7b_dapo_smoke.sh# ★ RL 冒烟 launch：model_path → SFT ckpt，验证 SFT→RL 衔接
 │       ├── smoke.slurm                 # ★ Slurm 作业（冒烟，调 run_qwen3_1.7b_smoke.sh）
 │       ├── sft.slurm                   # ★ Slurm 作业（SFT，调 run_qwen3_1.7b_sft.sh）
+│       ├── dapo_smoke.slurm            # ★ Slurm 作业（RL 冒烟，调 run_qwen3_1.7b_dapo_smoke.sh）
+│       ├── merge_sft_hf.slurm          # ★ Slurm 作业（FSDP→HF 合并，调 verl.model_merger）
+│       ├── make_dedup_dataset.py       # ★ DAPO-Math-17k 去重（179万→17398 行，按 prompt 文本）
+│       ├── watch_job.sh                # ★ 通用 job 监控（本地循环 + 短 SSH 抗掉线）
 │       ├── preflight_check.py          # ★ 冒烟前预检：Tool 执行行为（login node 可跑）
 │       ├── data_check2.py              # ★ 冒烟前预检：数据 schema + map_fn/map_fn2
 │       ├── import_check.py             # ★ 冒烟前预检：vllm/verl/数据集/Tool import
@@ -124,14 +132,17 @@
 │   │   ├── Maxwell-Jia/AIME_2024/aime_2024_problems.parquet
 │   │   └── yentinglin/aime_2025/{data,part1,part2}/*.parquet
 │   └── dataset_clean/          # ★ 软链重排 —— launch 脚本用这个
-│       ├── BytedTsinghua-SIA/DAPO-Math-17k/        (179万行，全量)
+│       ├── BytedTsinghua-SIA/DAPO-Math-17k/        (179万行，全量——名字叫17k是发布bug，实际~17k独特题×~100次重复)
 │       ├── BytedTsinghua-SIA/DAPO-Math-17k-smoke/  (64行，冒烟用，pyarrow 直切的真子集)
+│       ├── BytedTsinghua-SIA/DAPO-Math-17k-dedup/  (★ 17398行，按 prompt[0]["content"] 去重，RL 正式训练用这个)
 │       ├── Maxwell-Jia/AIME_2024/            (30题)
 │       ├── yentinglin/aime_2025/             (30题，来自 data/ 那份)
 │       └── JoeYing/ReTool-SFT/               (2000行，SFT 冷启动，sft_preprocess.py 产出 train.parquet)
 │
 ├── checkpoints/                # 训练产出的 checkpoint（按 experiment_name 分子目录）
 │   └── qwen3-1.7b-instruct-sft/  # ★ SFT 冷启动产物：global_step_{63..372}，最终 372（6 epoch × 62 step）
+│       ├── global_step_372/      # verl FSDP 格式（model_world_size_1_rank_0.pt + huggingface/），供 FSDP 加载
+│       └── global_step_372-hf/   # ★ HF 格式（safetensors），merge_sft_hf.slurm 转出，RL 冷启动 model_path 指这
 ├── outputs/                    # Slurm 日志（.out）与临时产物
 └── hf/                         # HF_HOME 缓存（模型/数据集下载缓存）
 ```
@@ -189,6 +200,7 @@ tool_config_path=recipe/retool/local_tool_config.yaml   # 相对 work/ 目录
 |---|---|
 | `code/retool-small-llm/recipe/retool/local_code_tool.py` | `.../retool/code/work/recipe/retool/local_code_tool.py` |
 | `code/retool-small-llm/recipe/retool/local_tool_config.yaml` | `.../retool/code/work/recipe/retool/local_tool_config.yaml` |
+| `code/retool-small-llm/recipe/retool/retool_dataset_utils.py`（★ 自研修复版：map_fn2 剥 DAPO 模板） | `.../retool/code/work/recipe/retool/retool_dataset_utils.py` |
 | `code/retool-small-llm/run_qwen3_1.7b_smoke.sh` | `.../retool/code/work/run_qwen3_1.7b_smoke.sh` |
 | `code/retool-small-llm/smoke.slurm` | `.../retool/code/work/smoke.slurm` |
 | `code/retool-small-llm/preflight_check.py` | `.../retool/code/work/preflight_check.py` |
@@ -221,8 +233,9 @@ scp $LOCAL/run_qwen3_1.7b_smoke.sh              $REMOTE/
 scp $LOCAL/smoke.slurm                          $REMOTE/
 ```
 
-> 只推**自研**文件。`recipe/retool/` 里官方那几个（`retool.py`、`retool_dataset_utils.py`、
-> `retool_sft_preprocess.py`）是当初从 `code/verl-recipe/retool/` 复制上去的，别覆盖。
+> 只推**自研**文件。`recipe/retool/` 里官方那几个（`retool.py`、`retool_sft_preprocess.py`）
+> 是当初从 `code/verl-recipe/retool/` 复制上去的，别覆盖。**例外**：`retool_dataset_utils.py`
+> 已被自研修复版（map_fn2 剥 DAPO 模板）覆盖，它的真源是 `code/retool-small-llm/recipe/retool/`。
 
 **提交冒烟作业 + 监控（在集群 login node 上）**
 
@@ -236,8 +249,9 @@ squeue -u $USER             # 看状态：PD=排队 / R=运行
 tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   # 看日志
 ```
 
-> 只推**自研**文件。`recipe/retool/` 里官方那几个（`retool.py`、`retool_dataset_utils.py`、
-> `retool_sft_preprocess.py`）是当初从 `code/verl-recipe/retool/` 复制上去的，别覆盖。
+> 只推**自研**文件。`recipe/retool/` 里官方那几个（`retool.py`、`retool_sft_preprocess.py`）
+> 是当初从 `code/verl-recipe/retool/` 复制上去的，别覆盖。**例外**：`retool_dataset_utils.py`
+> 已被自研修复版（map_fn2 剥 DAPO 模板）覆盖，它的真源是 `code/retool-small-llm/recipe/retool/`。
 
 ---
 
@@ -263,7 +277,14 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 - [x] 冒烟前预检三件套（login node 可跑，不占 GPU）：Tool 执行 19/19、数据 schema+映射 11/11、import 全绿
 - [x] 跑通 5 步冒烟测试（Gate 1）—— job 615359（`get_tcp_uri`）→ 615381（`wait_for_requests_to_drain`）→ 615461（`KeyError: num_turns`）→ 打 num_turns 补丁后 **job 615480 COMPLETED（10:54）**。四条验收全过：① `dataset len` 64/60；② `LocalCodeTool` 初始化 + `num_turns` 2–6 多轮工具调用；③ `critic/score` max=1.0/min=−1.0（reward 不全同，mean −0.62→−0.24 有信号）；④ `global_step_5/actor/{model,optim,extra_state}*.pt` + `huggingface/` 落盘
 - [x] SFT 阶段代码（`sft_preprocess.py` + FSDP SFT 训练）—— **✅ 完成（2026-10-08）**：job 663756 COMPLETED，ckpt `checkpoints/qwen3-1.7b-instruct-sft/global_step_372`
-- [ ] RL 训练（GRPO/DAPO）：`run_qwen3_1.7b_dapo.sh`，`actor_rollout_ref.model.path` → SFT ckpt `global_step_372`（对齐官方 dapo 脚本）
+- [x] **FSDP→HF 合并**（SFT→RL 衔接的权重侧修复）：`merge_sft_hf.slurm`（**job 668790 COMPLETED，1min**）经 `verl.model_merger --backend fsdp` 转出 `global_step_372-hf/`，含 `model.safetensors`（4.06GB）+ tokenizer/config 全在根目录；chat_template(4168)、`<tool_call>`、vocab 151669 均已验证
+- [x] RL 冒烟（验证 SFT→RL 衔接全链路）—— **✅ 衔接打通（job 668819 COMPLETED）**：tokenizer + HF 权重加载 + reward 信号 + ckpt 落盘全过。**但发现 SFT 冷启动负迁移**：base 首轮 19% 正确 vs SFT 0% 正确（256 rollout 零答对，max=−0.60）
+- [x] **诊断 SFT 负迁移根因**（`diag_sft_rollout.py` 跑 rollout 轨迹）：SFT 模型 4 类失败——①纯冗长推理不收敛（2048 token 空转不调工具不给答案）②理解错题→代码逻辑错（题 10 把公司数当节点数）③代码 SyntaxError + `<tool_call>` JSON 截断解析失败 ④**`\boxed{}` 格式全丢**（0/4 次输出，reward `strict_box_verify=True` 只认 boxed）。根因：**6 epoch 对 1.7B 过拟合/灾难性遗忘**，把 base 的「长推理→boxed」换成了「调工具但代码写不对」。（lr 本是 verl 默认 **1e-5**，此前误读成 1e-3 是 `fsdp_sft_trainer.py:522` 硬编码日志标签 `"train/lr(1e-3)"` 的锅——数值=真实 lr×1000，反推 step1 值 0.00027=1e-5×(1/37) 线性 warmup。）base 模型本身不调工具（num_turns 2.06），靠超长单轮推理硬算蒙对 19%
+- [x] **base 同款诊断对比**（`diag_sft_rollout.py` 跑 base `/scratch/.../data/model/Qwen3-1.7B`，**job 669552，8192 预算**，因 base 自然 response_length≈6919 不能被 2048 截断）：4 题 0 对，但**失败模式与 SFT 判然不同**——base 是「长 `<think>` 推理、多数不给 boxed、超时不收敛」（题 0/5 打满 8192 token 仍无答案；题 20 5870 token 后 boxed='25' 但错；题 10 2864 token 后竟也吐 `<tool_call>print("2014")` 然后答 `Answer: $2014$`）。**关键二次发现**：base 也卡在 `\boxed{}` 格式上（4 题只有 1 题给 boxed），题 10 直接跟了 DAPO 原 prompt 的 `Answer: $Answer` 格式而非 boxed——印证 §5 记录的「DAPO prompt 与 `answer_format` 格式冲突」对 base/SFT 都是独立瓶颈，不只是 SFT 负迁移。
+- [x] **格式冲突修复**：自研 `recipe/retool/retool_dataset_utils.py`（map_fn2 剥 DAPO 外层模板再追加 `\boxed{}`），scp 覆盖 work/recipe/retool/
+- [x] **温和 SFT 重训**：epoch 6→2、lr 1e-5、experiment_name `-2ep`，**job 671667 COMPLETED（24min，val/loss 0.453）**，ckpt `global_step_124`
+- [x] **merge + RL 冒烟验证负迁移已修复 ✅**（2026-10-09）：merge **job 671846** 转出 `-2ep/global_step_124-hf`（model.safetensors 4.06GB）；RL 冒烟 **job 671847 COMPLETED（6 步全跑完，退出码 0）**。结果：`critic/score/mean:-0.6156`（旧 SFT −0.881 → 回升到 base −0.622 水平）、**`score/max:1.0`**（至少一个样本产出与答案匹配的 `\boxed{}`，旧 SFT 格式冲突时永远到不了 1.0）、`aborted_ratio:0.0`、num_turns 6.125。日志尾部 `DataLoader worker killed by signal: Killed` 是 **atexit 关闭阶段的良性清理报错**（`Exception ignored in atexit callback`，出现在 ckpt `global_step_6` 落盘之后），非训练中崩溃；GPU `max_memory_reserved_gb:74.75` < 80GB 无显存 OOM。**结论：温和 SFT（2ep）+ 格式修复双管齐下，0% 负迁移已解除**
+- [ ] RL 正式训练（GRPO/DAPO）：`run_qwen3_1.7b_dapo.sh`，`model.path` → `-2ep/global_step_124-hf`，数据用 `DAPO-Math-17k-dedup`（17,398 行去重后）——**待冒烟验证通过后**
 - [ ] AIME 2024 评测加入固定评测脚本（官方 eval 只覆盖 AIME25）
 - [ ] 确认 DAPO-Math-17k 为何有 179 万行（名字叫 17k，需查证是否 repo 更新）
 
@@ -282,3 +303,8 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 | 2026-09-27 | **Gate 1 通过 ✅** job 615480 `COMPLETED`（10:54，MaxRSS 62GB，~2300 tok/s，`aborted_ratio:0.0`）。四条验收全绿：数据加载（`dataset len` 64/60）、沙箱执行（`LocalCodeTool` 初始化 + `num_turns` 2–6 + `tool_calls` 计时非零）、reward 不全同（每步 `score/max=1.0,min=−1.0`）、checkpoint 落盘（`global_step_5/actor/*.pt` + `huggingface/`） |
 | 2026-10-08 | **Qwen3 命名反转发现**：`Qwen/Qwen3-1.7B` 是 Instruct 版（`tokenizer_config.json` 含 tool_call `chat_template`），`-Base` 才是 base，**不存在 `-Instruct` 后缀**（HF 上 `Qwen3-1.7B-Instruct` 是 404）。据此把 SFT `MODEL_PATH` 定为 `Qwen3-1.7B`，对齐官方「用 Instruct 冷启动」 |
 | 2026-10-08 | **SFT 冷启动完成 ✅（Gate 2）**：`sft_preprocess.py` 产 `train.parquet`（2000 行多轮 tool 消息）；FSDP SFT 单卡 6 epoch，**job 663756 COMPLETED（~80min，13s/it×372 step）**，ckpt `qwen3-1.7b-instruct-sft/global_step_{63,126,189,252,315,372}`。连踩 4 坑：① fp32 OOM（job 663732，verl FSDP SFT 默认 `model_dtype=fp32`）→ ② `model.fsdp_config.model_dtype=bf16` 后仍 OOM（job 663739，logits 显存 = micro_batch×seq×vocab 与模型大小无关，官方 7B 靠 8 卡+ulysses SP=4 摊 1/8，单卡扛不住 micro_batch=4）→ ③ `micro_batch_size_per_gpu=2` 跑通但遇超长样本（job 663747，6 样本 >8192 token，`truncation=error` 崩）→ ④ `data.truncation=left` 全绿（job 663756） |
+| 2026-10-09 | **SFT→RL 衔接连踩 2 坑并修复**：① tokenizer 加载报 `TypeError: vocab_file=None`（job 664052/664071）——SFT 把 tokenizer/config 存到 `huggingface/` 子目录，而 RL `_build_model_optimizer:302` 从 `model.path` **根目录**读 tokenizer，`cp ckpt/huggingface/* ckpt/` 修掉；② HF 权重缺失报 `OSError: no file named model.safetensors`（job 668747）——SFT 默认 `save_contents` 不含 `hf_model`，只存 FSDP 权重，而 RL `:377` 用 `AutoModelForCausalLM.from_pretrained` 读 HF 权重，`verl.model_merger --backend fsdp` 合并出 `global_step_372-hf/`（**job 668790 COMPLETED，model.safetensors 4.06GB**）。合并后 tokenizer 验证齐全，`run_qwen3_1.7b_dapo_smoke.sh` 的 `model_path` 改指 `-hf` 目录，重提 RL 冒烟 **job 668819** |
+| 2026-10-09 | **RL 冒烟通过 + 发现 SFT 冷启动负迁移**：job 668819 COMPLETED，衔接全链路（tokenizer + HF 权重 + reward + ckpt）全过。但 **base 首轮 19% 正确 vs SFT 0% 正确**（256 rollout 零答对，step1 max=−0.60）。用 `diag_sft_rollout.py` 复现 verl hermes 工具循环看轨迹，定位 SFT 失败 4 类：①冗长推理不收敛（空转不调工具不给答案）②理解错题→代码逻辑错 ③代码 SyntaxError + `<tool_call>` JSON 截断 ④**`\boxed{}` 全丢**（reward `strict_box_verify=True` 只认 boxed）。根因 = **6 epoch 对 1.7B 灾难性遗忘**（lr 本是 verl 默认 1e-5，误读成 1e-3 是 `fsdp_sft_trainer.py:522` 硬编码日志标签的锅），把 base 的「长推理→boxed」换成「调工具但代码写不对」。base 本身不调工具（num_turns 2.06）靠长推理蒙对 19% |
+| 2026-10-09 | **base 同款诊断对比（job 669552，8192 预算）**：base 4 题 0 对但失败模式与 SFT 不同——base「长 `<think>` 推理、多数不给 boxed、超时不收敛」（题 0/5 打满 8192 仍无答案；题 20 5870 token 后 boxed='25' 错；题 10 2864 token 后吐 `print("2014")` 再答 `Answer: $2014$`）。**二次发现**：base 也卡 `\boxed{}` 格式（4 题仅 1 题给 boxed），题 10 直接跟 DAPO 的 `Answer: $Answer` 而非 boxed——「DAPO prompt 与 answer_format 格式冲突」对 base/SFT 都是独立瓶颈，不单是 SFT 负迁移 |
+| 2026-10-09 | **温和 SFT 重训 + 格式冲突修复（决定后落地）**：① 修格式——DAPO-Math-17k 题目外层模板（prefix `Solve...Answer: $Answer...\n\n` + suffix `Remember...after "Answer:".`）与 answer_format 的 `\boxed{}` 冲突，自研 `recipe/retool/retool_dataset_utils.py` 的 `map_fn2` 先剥模板再追加 boxed（AIME 走 `map_fn` 不变），scp 覆盖 work/recipe/retool/；② 温和 SFT——epoch 6→2、lr 显式 1e-5、experiment_name → `-2ep`，**job 671667 COMPLETED（24min，val/loss 0.453）**，ckpt `global_step_{62,124}`；③ 待 merge → RL 冒烟验证 0% 是否回升 |
+| 2026-10-09 | **merge + RL 冒烟验证负迁移已修复 ✅**：merge **job 671846**（`-2ep/global_step_124-hf`，model.safetensors 4.06GB）；RL 冒烟 **job 671847 COMPLETED（6 步，退出码 0）**。`critic/score/mean:-0.6156`（旧 SFT −0.881 → 回升到 base −0.622 水平）、**`score/max:1.0`**（有样本产出匹配 `\boxed{}`，旧 SFT 格式冲突时永远到不了）、`aborted_ratio:0.0`、num_turns 6.125。日志尾部 `DataLoader worker killed` 是 atexit 关闭阶段良性清理报错（在 ckpt `global_step_6` 落盘之后，非训练中崩溃），GPU `max_memory_reserved_gb:74.75` 无 OOM。**0% 负迁移已解除，可进正式 RL 训练** |

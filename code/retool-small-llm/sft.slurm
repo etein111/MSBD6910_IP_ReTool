@@ -1,6 +1,6 @@
 #!/bin/bash
-# ReTool SFT 冷启动 —— Qwen3-1.7B-Instruct + 多轮工具调用，单卡 6 epoch。
-# 产出 ckpt（checkpoints/qwen3-1.7b-instruct-sft/）作为 RL 的起点。
+# ReTool SFT 冷启动 —— Qwen3-1.7B-Instruct + 多轮工具调用，单卡 2 epoch（温和版）。
+# 产出 ckpt（checkpoints/qwen3-1.7b-instruct-sft-2ep/）作为 RL 的起点。
 #
 # 提交（在 login node）：
 #   sbatch /scratch/mscbdtspod2026/cyeah/retool/code/work/sft.slurm

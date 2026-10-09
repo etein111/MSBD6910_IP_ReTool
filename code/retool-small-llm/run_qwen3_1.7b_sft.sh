@@ -1,6 +1,11 @@
 #!/bin/bash
-# ReTool SFT 冷启动：Qwen3-1.7B-Instruct 多轮工具调用，单卡 6 epoch。
+# ReTool SFT 冷启动：Qwen3-1.7B-Instruct 多轮工具调用，单卡 2 epoch（温和版）。
 # 产出 ckpt 作为 RL 的起点（对齐官方：官方用 Instruct 做 SFT 冷启动）。
+#
+# 2026-10-09 由 6 epoch 改成 2 epoch：6 epoch 对 1.7B 灾难性遗忘（把 base 的
+# 「长推理→boxed」换成「调工具但代码写不对」，RL 首轮 19%→0%）。lr 本就是 1e-5
+# （verl 默认，之前误读成 1e-3 是 fsdp_sft_trainer.py:522 硬编码日志标签的锅），
+# 此处显式写 optim.lr=1e-5 固定意图。
 #
 # 基线来自官方 recipe 的 run_qwen2_7b_sft.sh，改动：
 #   - 模型用 Qwen/Qwen3-1.7B（Qwen3 不带后缀即 Instruct 版；官方 SFT 用 Qwen2.5-7B-Instruct）
@@ -31,7 +36,7 @@ EVAL_DATA=$TRAIN_DATA   # 与官方一致：SFT 用同一份做 val（不做真�
 MODEL_PATH=$DATA_ROOT/model/Qwen3-1.7B
 
 project_name=retool
-experiment_name=qwen3-1.7b-instruct-sft
+experiment_name=qwen3-1.7b-instruct-sft-2ep
 SAVE_PATH=$CKPT_ROOT/$experiment_name
 
 nnodes=1
@@ -54,12 +59,13 @@ torchrun --nnodes=$nnodes \
     model.partial_pretrain=$MODEL_PATH \
     model.strategy=fsdp \
     model.fsdp_config.model_dtype=bf16 \
+    optim.lr=1e-5 \
     trainer.default_local_dir=$SAVE_PATH \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.logger='["console"]' \
     trainer.n_gpus_per_node=1 \
-    trainer.total_epochs=6 \
-    trainer.save_freq=63 \
+    trainer.total_epochs=2 \
+    trainer.save_freq=62 \
     ulysses_sequence_parallel_size=1 \
     use_remove_padding=true "$@"
