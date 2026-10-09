@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Claude Code 本地设置（不进入项目仓库）
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 第三方 clone 的上游仓库（本地保留，非本项目源码；recipe/retool 的自有文件已在 code/retool-small-llm/ 内）
+code/verl-recipe/
+code/agentic-rl-lab/
+
+# 大型演示二进制（ppt/potx，133MB，不适合代码仓库）
+Pre_PPT/
+
+# HKUST 课程内部行政材料（公开仓库不入）
+IP_NZ7_Student_Guideline.docx
+IS Project Meetings - Google Docs.pdf
+Project Titles for BDT 2026 Fall_Canvas.xlsx
