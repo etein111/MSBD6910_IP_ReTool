@@ -89,6 +89,9 @@
 10. **SFT→RL 衔接：verl 0.6.1 的 RL 从 `model.path` 根目录加载 tokenizer + config + HF 权重，但 SFT ckpt 三者都不在根目录**。两处要补（2026-10-09 踩过，job 664052/664071/668747 连环 FAILED）：
     - **tokenizer/config 在 `huggingface/` 子目录**：`fsdp_workers.py:302` `hf_tokenizer(local_path)` 与 `:320` `AutoConfig.from_pretrained(local_path)` 都读**根目录**，而 SFT 把它们存进 `huggingface/`。症状 `TypeError: vocab_file=None`（慢速 tokenizer 在根目录找不到 vocab.json）。修法：`cp ckpt/huggingface/* ckpt/` 铺到根目录。
     - **缺 HF 权重（safetensors）**：SFT 默认 `trainer.checkpoint.save_contents=["model","optimizer","extra"]` **不含 `hf_model`**，ckpt 只有 FSDP 权重 `model_world_size_1_rank_0.pt`。RL `_build_model_optimizer:377` 用 `AutoModelForCausalLM.from_pretrained(local_path)` 加载 HF 权重，报 `OSError: no file named pytorch_model.bin / model.safetensors`。修法：用 verl 自带 merger 转 HF：`python -m verl.model_merger merge --backend fsdp --local_dir <ckpt> --target_dir <ckpt>-hf`（从 `local_dir/huggingface/config.json` 读 config），RL 的 `model_path` 指向 `-hf` 目录。
+11. **账户有 GPU 分钟预算，不是墙钟上限（2026-10-10 踩过）**：account `mscbdtspod2026` 有 `GrpTRESMins=gres/gpu=9600`（≈160 GPU·h 总量），QOS MaxWall=3d、MaxSubmit=2。8×GPU 的 `--time` 上限 ≈ 9600/8/60 ≈ 17h，且随历史 job 消耗递减。`sbatch --time=48:00:00`（23040 GPU·min）会报 `AssocGrpGRESMinutes / Job violates accounting/QOS policy`。**提交前先 `sacct -A mscbdtspod2026 -X` 累加已用 GPU·min，`--time ≤ (9600−已用)/8`，别按墙钟拍脑袋。**
+12. **1.7B 多卡别用 ulysses SP / vllm TP（2026-10-10 踩过）**：照抄官方 7B recipe 的 `train_sp=4/infer_tp=4`，8 卡冒烟 job 672236 报 `all_to_all → ncclUnhandledCudaError → Cuda failure 'out of memory'`。根因 ulysses SP 的 `all_to_all` NCCL collective 是给 7B+/长序列摊显存的，1.7B 单卡放得下，SP/TP 只添乱。**修法**：`train_sp=1 / infer_tp=1 / offload=False`（纯 FSDP 数据并行 + 8 份 vllm(TP=1)），8 卡冒烟 672270 通过，`max_memory_reserved_gb` 53。
+13. **工具名不匹配 + max_turns 过大 → rollout 极慢（2026-10-10 踩过）**：`local_tool_config.yaml` 里工具名是 `code_interpreter`，但 SFT-2ep 冷启动模型常生成错名（`code_editor`/`code_executor`/`solving_quadratic`）和坏 JSON（`Failed to decode tool call`）。`max_turns=16` 时模型不收敛、响应顶到 8192 token，job 675119 首步 rollout 1h+ 未走完。**修法**：`max_turns=8`（冒烟 672270 实测 ~3.3 轮收敛、响应均值 1778 token、41s/步）+ `n_resp_per_prompt=4`，正式 job 675200 落到 ~108s/步。
 
 ---
 
@@ -117,6 +120,9 @@
 │       ├── smoke.slurm                 # ★ Slurm 作业（冒烟，调 run_qwen3_1.7b_smoke.sh）
 │       ├── sft.slurm                   # ★ Slurm 作业（SFT，调 run_qwen3_1.7b_sft.sh）
 │       ├── dapo_smoke.slurm            # ★ Slurm 作业（RL 冒烟，调 run_qwen3_1.7b_dapo_smoke.sh）
+│       ├── dapo_smoke_8gpu.slurm      # ★ Slurm 作业（8 卡 RL 冒烟，覆盖 n_gpus_per_node=8 + experiment_name）
+│       ├── run_qwen3_1.7b_dapo.sh     # ★ RL 正式训练 launch（DAPO/GRPO，全量 dedup 数据，8 卡，n=4/max_turns=8）
+│       ├── dapo.slurm                  # ★ Slurm 作业（RL 正式，调 run_qwen3_1.7b_dapo.sh，--time=15h）
 │       ├── merge_sft_hf.slurm          # ★ Slurm 作业（FSDP→HF 合并，调 verl.model_merger）
 │       ├── make_dedup_dataset.py       # ★ DAPO-Math-17k 去重（179万→17398 行，按 prompt 文本）
 │       ├── watch_job.sh                # ★ 通用 job 监控（本地循环 + 短 SSH 抗掉线）
@@ -140,9 +146,12 @@
 │       └── JoeYing/ReTool-SFT/               (2000行，SFT 冷启动，sft_preprocess.py 产出 train.parquet)
 │
 ├── checkpoints/                # 训练产出的 checkpoint（按 experiment_name 分子目录）
-│   └── qwen3-1.7b-instruct-sft/  # ★ SFT 冷启动产物：global_step_{63..372}，最终 372（6 epoch × 62 step）
-│       ├── global_step_372/      # verl FSDP 格式（model_world_size_1_rank_0.pt + huggingface/），供 FSDP 加载
-│       └── global_step_372-hf/   # ★ HF 格式（safetensors），merge_sft_hf.slurm 转出，RL 冷启动 model_path 指这
+│   ├── qwen3-1.7b-instruct-sft/      # SFT 6ep（已弃用）：global_step_{63..372}
+│   ├── qwen3-1.7b-instruct-sft-2ep/  # ★ SFT 2ep 冷启动（现用）：global_step_{62,124}
+│   │   └── global_step_124-hf/       # ★ HF 格式（safetensors），RL 冷启动 model_path 指这
+│   ├── qwen3-1.7b-dapo-smoke-8gpu/   # 8 卡 RL 冒烟（job 672270）产物
+│   ├── qwen3-1.7b-dapo/              # ★ RL 正式训练（job 675200，272 步/epoch）
+│   └── qwen3-1.7b-dapo-cancelled-step20/  # 被取消的 675119 留的 step20 ckpt（mv 归档，防自动恢复冲突）
 ├── outputs/                    # Slurm 日志（.out）与临时产物
 └── hf/                         # HF_HOME 缓存（模型/数据集下载缓存）
 ```
@@ -202,6 +211,10 @@ tool_config_path=recipe/retool/local_tool_config.yaml   # 相对 work/ 目录
 | `code/retool-small-llm/recipe/retool/local_tool_config.yaml` | `.../retool/code/work/recipe/retool/local_tool_config.yaml` |
 | `code/retool-small-llm/recipe/retool/retool_dataset_utils.py`（★ 自研修复版：map_fn2 剥 DAPO 模板） | `.../retool/code/work/recipe/retool/retool_dataset_utils.py` |
 | `code/retool-small-llm/run_qwen3_1.7b_smoke.sh` | `.../retool/code/work/run_qwen3_1.7b_smoke.sh` |
+| `code/retool-small-llm/run_qwen3_1.7b_dapo.sh` | `.../retool/code/work/run_qwen3_1.7b_dapo.sh` |
+| `code/retool-small-llm/run_qwen3_1.7b_dapo_smoke.sh` | `.../retool/code/work/run_qwen3_1.7b_dapo_smoke.sh` |
+| `code/retool-small-llm/dapo.slurm` | `.../retool/code/work/dapo.slurm` |
+| `code/retool-small-llm/dapo_smoke_8gpu.slurm` | `.../retool/code/work/dapo_smoke_8gpu.slurm` |
 | `code/retool-small-llm/smoke.slurm` | `.../retool/code/work/smoke.slurm` |
 | `code/retool-small-llm/preflight_check.py` | `.../retool/code/work/preflight_check.py` |
 | `code/retool-small-llm/data_check2.py` | `.../retool/code/work/data_check2.py` |
@@ -285,6 +298,8 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 - [x] **温和 SFT 重训**：epoch 6→2、lr 1e-5、experiment_name `-2ep`，**job 671667 COMPLETED（24min，val/loss 0.453）**，ckpt `global_step_124`
 - [x] **merge + RL 冒烟验证负迁移已修复 ✅**（2026-10-09）：merge **job 671846** 转出 `-2ep/global_step_124-hf`（model.safetensors 4.06GB）；RL 冒烟 **job 671847 COMPLETED（6 步全跑完，退出码 0）**。结果：`critic/score/mean:-0.6156`（旧 SFT −0.881 → 回升到 base −0.622 水平）、**`score/max:1.0`**（至少一个样本产出与答案匹配的 `\boxed{}`，旧 SFT 格式冲突时永远到不了 1.0）、`aborted_ratio:0.0`、num_turns 6.125。日志尾部 `DataLoader worker killed by signal: Killed` 是 **atexit 关闭阶段的良性清理报错**（`Exception ignored in atexit callback`，出现在 ckpt `global_step_6` 落盘之后），非训练中崩溃；GPU `max_memory_reserved_gb:74.75` < 80GB 无显存 OOM。**结论：温和 SFT（2ep）+ 格式修复双管齐下，0% 负迁移已解除**
 - [ ] RL 正式训练（GRPO/DAPO）：`run_qwen3_1.7b_dapo.sh`，`model.path` → `-2ep/global_step_124-hf`，数据用 `DAPO-Math-17k-dedup`（17,398 行去重后）——**待冒烟验证通过后**
+- [x] **8 卡 RL 冒烟验证多卡加速 ✅（job 672270 COMPLETED，6m24s）**：纯 FSDP + 8×vllm(TP=1)，8-rank ckpt 落盘，reward 信号正常，无 OOM（`max_memory_reserved_gb` 53.07）
+- [x] **RL 正式训练（job 675200）✅ COMPLETED（9h08m，退出码 0，271/271 步）**：`run_qwen3_1.7b_dapo.sh`（n=4 / max_turns=8 / SP=1 / TP=1 / offload=False），`model.path`→`-2ep/global_step_124-hf`，数据 `DAPO-Math-17k-dedup`（17,398 行→271 步/epoch），`--time=15h`。终态 `critic/score/mean` **-0.643→+0.230**；AIME2024 `acc/best@4` **29.3%→50.6%**、`acc/mean@4` 18.3%→37.5%；AIME2025 `acc/best@4` **26.3%→48.3%**、`acc/mean@4` 16.7%→35.8%；num_turns 4.5→10.1。ckpt `global_step_{20..260,271}` 落盘，`latest_checkpointed_iteration=271`
 - [ ] AIME 2024 评测加入固定评测脚本（官方 eval 只覆盖 AIME25）
 - [ ] 确认 DAPO-Math-17k 为何有 179 万行（名字叫 17k，需查证是否 repo 更新）
 
@@ -308,3 +323,9 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 | 2026-10-09 | **base 同款诊断对比（job 669552，8192 预算）**：base 4 题 0 对但失败模式与 SFT 不同——base「长 `<think>` 推理、多数不给 boxed、超时不收敛」（题 0/5 打满 8192 仍无答案；题 20 5870 token 后 boxed='25' 错；题 10 2864 token 后吐 `print("2014")` 再答 `Answer: $2014$`）。**二次发现**：base 也卡 `\boxed{}` 格式（4 题仅 1 题给 boxed），题 10 直接跟 DAPO 的 `Answer: $Answer` 而非 boxed——「DAPO prompt 与 answer_format 格式冲突」对 base/SFT 都是独立瓶颈，不单是 SFT 负迁移 |
 | 2026-10-09 | **温和 SFT 重训 + 格式冲突修复（决定后落地）**：① 修格式——DAPO-Math-17k 题目外层模板（prefix `Solve...Answer: $Answer...\n\n` + suffix `Remember...after "Answer:".`）与 answer_format 的 `\boxed{}` 冲突，自研 `recipe/retool/retool_dataset_utils.py` 的 `map_fn2` 先剥模板再追加 boxed（AIME 走 `map_fn` 不变），scp 覆盖 work/recipe/retool/；② 温和 SFT——epoch 6→2、lr 显式 1e-5、experiment_name → `-2ep`，**job 671667 COMPLETED（24min，val/loss 0.453）**，ckpt `global_step_{62,124}`；③ 待 merge → RL 冒烟验证 0% 是否回升 |
 | 2026-10-09 | **merge + RL 冒烟验证负迁移已修复 ✅**：merge **job 671846**（`-2ep/global_step_124-hf`，model.safetensors 4.06GB）；RL 冒烟 **job 671847 COMPLETED（6 步，退出码 0）**。`critic/score/mean:-0.6156`（旧 SFT −0.881 → 回升到 base −0.622 水平）、**`score/max:1.0`**（有样本产出匹配 `\boxed{}`，旧 SFT 格式冲突时永远到不了）、`aborted_ratio:0.0`、num_turns 6.125。日志尾部 `DataLoader worker killed` 是 atexit 关闭阶段良性清理报错（在 ckpt `global_step_6` 落盘之后，非训练中崩溃），GPU `max_memory_reserved_gb:74.75` 无 OOM。**0% 负迁移已解除，可进正式 RL 训练** |
+| 2026-10-10 | **8 卡多卡验证 ✅（job 672270 COMPLETED，6m24s）**：纯 FSDP + 8×vllm(TP=1)，8-rank ckpt 落盘、reward 信号正常、`max_memory_reserved_gb` 53.07 无 OOM。**先踩了 SP/TP 的坑**：照抄 7B recipe 的 `train_sp=4/infer_tp=4` → job 672236 报 `all_to_all` NCCL OOM（见坑 #12），改成 SP=1/TP=1 后通过 |
+| 2026-10-10 | **发现 GPU 分钟预算约束**：`GrpTRESMins=gres/gpu=9600`（≈160 GPU·h），8×GPU 的 `--time` 上限 ≈17h。`--time=48h` 被拒（`AssocGrpGRESMinutes`），见坑 #11 |
+| 2026-10-10 | **正式 RL 首跑（job 674976）卡 val_before_train 被取消**：`n_resp_per_prompt_val=30` × 60 题 = 1800 响应 × 16 轮工具循环，70+ 分钟没走完。修：`val_before_train=False` + `test_freq=50` + `n_val=8` |
+| 2026-10-10 | **正式 RL 二跑（job 675119）卡 rollout 被取消**：`max_turns=16` + n=8 时，SFT-2ep 模型生成错工具名（`code_editor`/`code_executor`/`solving_quadratic`，配置里叫 `code_interpreter`）+ 坏 JSON，响应不收敛顶到 8192 token，首步 rollout 1h+。日志显示实际 ~2.5min/步、到 step 20 存了 ckpt（说明非死锁，是太慢）。修：回退冒烟实证的 `max_turns=8` + `n_resp_per_prompt=4`（见坑 #13） |
+| 2026-10-10 | **正式 RL 三跑（job 675200，当前）✅ 正在学习**：n=4/max_turns=8/SP=1/TP=1，`--time=15h`（预算余量内）。~108s/步；133/271 步（~50%）时 `critic/score/mean` **-0.643→+0.247**、AIME2024 `best@4` **-0.355→+0.052（过零）**、AIME2025 `mean@4` **-0.625→-0.474**、num_turns 4.5→9.3（学到更长的工具调用链）。stale ckpt/tb 已 mv 归档防自动恢复冲突 |
+| 2026-10-10 | **正式 RL 三跑（job 675200）✅ COMPLETED（9h08m，退出码 0，271/271 步）**：终态 `critic/score/mean` **-0.643→+0.230**、num_turns 4.47→10.05（模型学会用 ~10 轮工具调用链）；**AIME2024 `acc/best@4` 29.3%→50.6%、`acc/mean@4` 18.3%→37.5%**；**AIME2025 `acc/best@4` 26.3%→48.3%、`acc/mean@4` 16.7%→35.8%**。ckpt `global_step_{20..260,271}` 落盘（`latest_checkpointed_iteration=271`）。**结论：ReTool agentic RL 在 1.7B 上跑通且有效——AIME 最佳采样正确率近翻倍** |
