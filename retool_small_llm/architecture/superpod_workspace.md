@@ -92,6 +92,7 @@
 11. **账户有 GPU 分钟预算，不是墙钟上限（2026-10-10 踩过）**：account `mscbdtspod2026` 有 `GrpTRESMins=gres/gpu=9600`（≈160 GPU·h 总量），QOS MaxWall=3d、MaxSubmit=2。8×GPU 的 `--time` 上限 ≈ 9600/8/60 ≈ 17h，且随历史 job 消耗递减。`sbatch --time=48:00:00`（23040 GPU·min）会报 `AssocGrpGRESMinutes / Job violates accounting/QOS policy`。**提交前先 `sacct -A mscbdtspod2026 -X` 累加已用 GPU·min，`--time ≤ (9600−已用)/8`，别按墙钟拍脑袋。**
 12. **1.7B 多卡别用 ulysses SP / vllm TP（2026-10-10 踩过）**：照抄官方 7B recipe 的 `train_sp=4/infer_tp=4`，8 卡冒烟 job 672236 报 `all_to_all → ncclUnhandledCudaError → Cuda failure 'out of memory'`。根因 ulysses SP 的 `all_to_all` NCCL collective 是给 7B+/长序列摊显存的，1.7B 单卡放得下，SP/TP 只添乱。**修法**：`train_sp=1 / infer_tp=1 / offload=False`（纯 FSDP 数据并行 + 8 份 vllm(TP=1)），8 卡冒烟 672270 通过，`max_memory_reserved_gb` 53。
 13. **工具名不匹配 + max_turns 过大 → rollout 极慢（2026-10-10 踩过）**：`local_tool_config.yaml` 里工具名是 `code_interpreter`，但 SFT-2ep 冷启动模型常生成错名（`code_editor`/`code_executor`/`solving_quadratic`）和坏 JSON（`Failed to decode tool call`）。`max_turns=16` 时模型不收敛、响应顶到 8192 token，job 675119 首步 rollout 1h+ 未走完。**修法**：`max_turns=8`（冒烟 672270 实测 ~3.3 轮收敛、响应均值 1778 token、41s/步）+ `n_resp_per_prompt=4`，正式 job 675200 落到 ~108s/步。
+14. **RL checkpoint 合并的 --local_dir 要指向 actor/ 子目录（2026-10-15 踩过）**：verl 0.6.1 的 RL checkpoint 结构是 `global_step_271/actor/`（含 `model_world_size_8_rank_*.pt` + `huggingface/` + `fsdp_config.json`），而 SFT 那次是平铺在根目录。merge 时 RL 要 `--local_dir .../global_step_271/actor`（不是根目录），否则 merger 找不到分片。产出 `global_step_271-hf/`（model.safetensors 4.06GB），供独立评测当 model_path。
 
 ---
 
@@ -124,6 +125,10 @@
 │       ├── run_qwen3_1.7b_dapo.sh     # ★ RL 正式训练 launch（DAPO/GRPO，全量 dedup 数据，8 卡，n=4/max_turns=8）
 │       ├── dapo.slurm                  # ★ Slurm 作业（RL 正式，调 run_qwen3_1.7b_dapo.sh，--time=15h）
 │       ├── merge_sft_hf.slurm          # ★ Slurm 作业（FSDP→HF 合并，调 verl.model_merger）
+│       ├── merge_rl_hf.slurm           # ★ Slurm 作业（RL final FSDP→HF 合并；--local_dir 要指向 .../global_step_271/actor）
+│       ├── eval_qwen3_1.7b.sh          # ★ 冻结协议独立评测 launch（val-only：12 采样，tool/text，参数化 EVAL_MODEL_PATH/EVAL_MODE/EVAL_EXP）
+│       ├── eval_smoke.slurm            # ★ Slurm 作业（评测冒烟：base+text，验证 eval 脚本端到端）
+│       ├── eval.slurm                  # ★ Slurm 作业（全套 6 组评测：base/sft/rl × tool/text 循环）
 │       ├── make_dedup_dataset.py       # ★ DAPO-Math-17k 去重（179万→17398 行，按 prompt 文本）
 │       ├── watch_job.sh                # ★ 通用 job 监控（本地循环 + 短 SSH 抗掉线）
 │       ├── preflight_check.py          # ★ 冒烟前预检：Tool 执行行为（login node 可跑）
@@ -150,7 +155,9 @@
 │   ├── qwen3-1.7b-instruct-sft-2ep/  # ★ SFT 2ep 冷启动（现用）：global_step_{62,124}
 │   │   └── global_step_124-hf/       # ★ HF 格式（safetensors），RL 冷启动 model_path 指这
 │   ├── qwen3-1.7b-dapo-smoke-8gpu/   # 8 卡 RL 冒烟（job 672270）产物
-│   ├── qwen3-1.7b-dapo/              # ★ RL 正式训练（job 675200，272 步/epoch）
+│   ├── qwen3-1.7b-dapo/              # ★ RL 正式训练（job 675200，271 步/epoch）
+│   │   └── global_step_271-hf/       # ★ RL final 的 HF 合并（merge_rl_hf.slurm，job 685931），独立评测 model_path 指这
+│   ├── qwen3-1.7b-eval-*/           # ★ 独立评测 tensorboard 目录（6 组+smoke，job 686226/685932）
 │   └── qwen3-1.7b-dapo-cancelled-step20/  # 被取消的 675119 留的 step20 ckpt（mv 归档，防自动恢复冲突）
 ├── outputs/                    # Slurm 日志（.out）与临时产物
 └── hf/                         # HF_HOME 缓存（模型/数据集下载缓存）
@@ -220,6 +227,10 @@ tool_config_path=recipe/retool/local_tool_config.yaml   # 相对 work/ 目录
 | `code/retool-small-llm/data_check2.py` | `.../retool/code/work/data_check2.py` |
 | `code/retool-small-llm/import_check.py` | `.../retool/code/work/import_check.py` |
 | `code/retool-small-llm/make_smoke_subset.py` | `.../retool/code/work/make_smoke_subset.py` |
+| `code/retool-small-llm/eval_qwen3_1.7b.sh` | `.../retool/code/work/eval_qwen3_1.7b.sh` |
+| `code/retool-small-llm/eval_smoke.slurm` | `.../retool/code/work/eval_smoke.slurm` |
+| `code/retool-small-llm/eval.slurm` | `.../retool/code/work/eval.slurm` |
+| `code/retool-small-llm/merge_rl_hf.slurm` | `.../retool/code/work/merge_rl_hf.slurm` |
 | `code/verl-recipe/retool/*`（官方参考，只读） | `.../retool/code/verl-recipe/retool/*` + 复制到 `work/recipe/retool/` |
 
 > **约定**：改自研代码一律**先改本地**，再用 `scp` 推上集群，保证本地仓库是唯一真相源。
@@ -300,7 +311,8 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 - [ ] RL 正式训练（GRPO/DAPO）：`run_qwen3_1.7b_dapo.sh`，`model.path` → `-2ep/global_step_124-hf`，数据用 `DAPO-Math-17k-dedup`（17,398 行去重后）——**待冒烟验证通过后**
 - [x] **8 卡 RL 冒烟验证多卡加速 ✅（job 672270 COMPLETED，6m24s）**：纯 FSDP + 8×vllm(TP=1)，8-rank ckpt 落盘，reward 信号正常，无 OOM（`max_memory_reserved_gb` 53.07）
 - [x] **RL 正式训练（job 675200）✅ COMPLETED（9h08m，退出码 0，271/271 步）**：`run_qwen3_1.7b_dapo.sh`（n=4 / max_turns=8 / SP=1 / TP=1 / offload=False），`model.path`→`-2ep/global_step_124-hf`，数据 `DAPO-Math-17k-dedup`（17,398 行→271 步/epoch），`--time=15h`。终态 `critic/score/mean` **-0.643→+0.230**；AIME2024 `acc/best@4` **29.3%→50.6%**、`acc/mean@4` 18.3%→37.5%；AIME2025 `acc/best@4` **26.3%→48.3%**、`acc/mean@4` 16.7%→35.8%；num_turns 4.5→10.1。ckpt `global_step_{20..260,271}` 落盘，`latest_checkpointed_iteration=271`
-- [ ] AIME 2024 评测加入固定评测脚本（官方 eval 只覆盖 AIME25）
+- [x] **冻结协议独立评测（12 采样，tool/text，base/SFT/RL 三检查点）✅（2026-10-15）**：`eval_qwen3_1.7b.sh`（val-only：`val_before_train=True` + `total_training_steps=1` + `n_resp_per_prompt_val=12`）+ `merge_rl_hf.slurm`（RL final 合并）+ `eval.slurm`（6 组循环）。冒烟 job **685932**（base+text）通过，全套 job **686226 COMPLETED（42min，6 组全 OK）**。结果（AIME 2024/2025 acc@12）：base-tool 22.8/22.5、base-text 16.4/16.9、sft-tool 11.7/14.4（负迁移）、sft-text 5.0/8.9、**rl-tool mean 41.1/35.0、best 70.5/55.3**、rl-text 10.8/8.1；num_turns（tool）2.0→4.8→8.6
+- [ ] **GRPO 对照（E3）**：`clip_ratio_high=0.0` + `experiment_name=qwen3-1.7b-grpo`，同 271 步预算 → 检验 H3（DAPO vs GRPO 稳定性）
 - [ ] 确认 DAPO-Math-17k 为何有 179 万行（名字叫 17k，需查证是否 repo 更新）
 
 ---
@@ -329,3 +341,4 @@ tail -f /scratch/mscbdtspod2026/cyeah/retool/outputs/retool_smoke_<jobid>.out   
 | 2026-10-10 | **正式 RL 二跑（job 675119）卡 rollout 被取消**：`max_turns=16` + n=8 时，SFT-2ep 模型生成错工具名（`code_editor`/`code_executor`/`solving_quadratic`，配置里叫 `code_interpreter`）+ 坏 JSON，响应不收敛顶到 8192 token，首步 rollout 1h+。日志显示实际 ~2.5min/步、到 step 20 存了 ckpt（说明非死锁，是太慢）。修：回退冒烟实证的 `max_turns=8` + `n_resp_per_prompt=4`（见坑 #13） |
 | 2026-10-10 | **正式 RL 三跑（job 675200，当前）✅ 正在学习**：n=4/max_turns=8/SP=1/TP=1，`--time=15h`（预算余量内）。~108s/步；133/271 步（~50%）时 `critic/score/mean` **-0.643→+0.247**、AIME2024 `best@4` **-0.355→+0.052（过零）**、AIME2025 `mean@4` **-0.625→-0.474**、num_turns 4.5→9.3（学到更长的工具调用链）。stale ckpt/tb 已 mv 归档防自动恢复冲突 |
 | 2026-10-10 | **正式 RL 三跑（job 675200）✅ COMPLETED（9h08m，退出码 0，271/271 步）**：终态 `critic/score/mean` **-0.643→+0.230**、num_turns 4.47→10.05（模型学会用 ~10 轮工具调用链）；**AIME2024 `acc/best@4` 29.3%→50.6%、`acc/mean@4` 18.3%→37.5%**；**AIME2025 `acc/best@4` 26.3%→48.3%、`acc/mean@4` 16.7%→35.8%**。ckpt `global_step_{20..260,271}` 落盘（`latest_checkpointed_iteration=271`）。**结论：ReTool agentic RL 在 1.7B 上跑通且有效——AIME 最佳采样正确率近翻倍** |
+| 2026-10-15 | **独立评测脚本 + 冻结协议 12 采样评测完成 ✅**：新增 4 脚本（`eval_qwen3_1.7b.sh` val-only 评测、`eval_smoke.slurm` 冒烟、`eval.slurm` 6 组循环、`merge_rl_hf.slurm` RL final 合并）。merge job **685931**（`global_step_271/actor` → `global_step_271-hf`，model.safetensors 4.06GB，1min）；冒烟 job **685932**（base+text，10min，退出码 0）；全套 job **686226 COMPLETED（42min，6 组全 OK）**。**结果（AIME 2024/2025 acc@12）**：base-tool 22.8/22.5、base-text 16.4/16.9、sft-tool 11.7/14.4、sft-text 5.0/8.9、**rl-tool mean 41.1/35.0、best 70.5/55.3**、rl-text 10.8/8.1；num_turns（tool）2.0→4.8→8.6。**三发现**：①RL 增益成立（base→rl-tool mean +18.3、best 44.4→70.5）②增益全由工具驱动（rl-text 10.8 反低于 base-text 16.4）③SFT 负迁移（sft-tool 11.7 < base-tool 22.8，`Answer:` vs `\boxed{}` 冲突）。产出讲稿 `presentation/presentation_2_progress_slides.md` |
